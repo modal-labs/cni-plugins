@@ -32,10 +32,20 @@ var ErrLinkNotFound = errors.New("link not found")
 
 // makeVethPair is called from within the container's network namespace
 func makeVethPair(name, peer string, mtu int, mac string, hostNS ns.NetNS) (netlink.Link, error) {
+	// Pin the veth pair to a single RX/TX queue per side. Without explicit
+	// IFLA_NUM_{TX,RX}_QUEUES, the veth driver allocates
+	// min(num_possible_cpus(), 4096) queues per side (see veth_get_num_queues
+	// in drivers/net/veth.c), each creating a sysfs kobject under rtnl_lock
+	// during register_netdev. On a 120-CPU host we measured ~50ms mean /
+	// ~73ms max rtnl_mutex hold per veth pair creation without this, vs
+	// ~3.5ms with it. (veth_newlink does shrink real_num_*_queues to 1 by
+	// default, but that does not free the allocated per-queue kobjects.)
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
-			Name: name,
-			MTU:  mtu,
+			Name:        name,
+			MTU:         mtu,
+			NumTxQueues: 1,
+			NumRxQueues: 1,
 		},
 		PeerName:      peer,
 		PeerNamespace: netlink.NsFd(int(hostNS.Fd())),
