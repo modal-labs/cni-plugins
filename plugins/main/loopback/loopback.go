@@ -30,6 +30,12 @@ import (
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
 
+// `lo` is always interface index 1 inside any newly-created network namespace.
+// Hardcoding it lets us avoid a `RTM_GETLINK` ("LinkByName") roundtrip on the
+// global rtnl_mutex for every container start/stop -- under saturated container
+// churn that lookup is a meaningful contributor to rtnl_mutex contention.
+const loopbackIfIndex = 1
+
 func parseNetConf(bytes []byte) (*types.NetConf, error) {
 	conf := &types.NetConf{}
 	if err := json.Unmarshal(bytes, conf); err != nil {
@@ -54,48 +60,21 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	var v4Addr, v6Addr *net.IPNet
-
 	args.IfName = "lo" // ignore config, this only works for loopback
 	err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-		link, err := netlink.LinkByName(args.IfName)
-		if err != nil {
-			return err // not tested
+		// Bring `lo` up using its well-known ifindex (1) -- skipping the
+		// `LinkByName` lookup that the original plugin did before this. That
+		// lookup is a `RTM_GETLINK` which takes `rtnl_mutex`; on hosts under
+		// container-spinup load, eliminating it removes a meaningful slice of
+		// rtnl pressure. The previous AddrList sanity checks have also been
+		// dropped: they were two `RTM_GETADDR` dumps per invocation (a much
+		// larger source of contention) and the addresses they returned were
+		// only used to populate `result.IPs` for downstream plugins, which
+		// modal's bridge plugin chain does not consume from loopback.
+		loLink := &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: loopbackIfIndex, Name: args.IfName}}
+		if err := netlink.LinkSetUp(loLink); err != nil {
+			return err
 		}
-
-		err = netlink.LinkSetUp(link)
-		if err != nil {
-			return err // not tested
-		}
-
-		v4Addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
-		if err != nil {
-			return err // not tested
-		}
-		if len(v4Addrs) != 0 {
-			v4Addr = v4Addrs[0].IPNet
-			// sanity check that this is a loopback address
-			for _, addr := range v4Addrs {
-				if !addr.IP.IsLoopback() {
-					return fmt.Errorf("loopback interface found with non-loopback address %q", addr.IP)
-				}
-			}
-		}
-
-		v6Addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
-		if err != nil {
-			return err // not tested
-		}
-		if len(v6Addrs) != 0 {
-			v6Addr = v6Addrs[0].IPNet
-			// sanity check that this is a loopback address
-			for _, addr := range v6Addrs {
-				if !addr.IP.IsLoopback() {
-					return fmt.Errorf("loopback interface found with non-loopback address %q", addr.IP)
-				}
-			}
-		}
-
 		return nil
 	})
 	if err != nil {
@@ -108,7 +87,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		// loopback should pass it transparently
 		result = conf.PrevResult
 	} else {
-		r := &current.Result{
+		result = &current.Result{
 			CNIVersion: conf.CNIVersion,
 			Interfaces: []*current.Interface{
 				{
@@ -118,56 +97,18 @@ func cmdAdd(args *skel.CmdArgs) error {
 				},
 			},
 		}
-
-		if v4Addr != nil {
-			r.IPs = append(r.IPs, &current.IPConfig{
-				Interface: current.Int(0),
-				Address:   *v4Addr,
-			})
-		}
-
-		if v6Addr != nil {
-			r.IPs = append(r.IPs, &current.IPConfig{
-				Interface: current.Int(0),
-				Address:   *v6Addr,
-			})
-		}
-
-		result = r
 	}
 
 	return types.PrintResult(result, conf.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	if args.Netns == "" {
-		return nil
-	}
-	args.IfName = "lo" // ignore config, this only works for loopback
-	err := ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
-		link, err := netlink.LinkByName(args.IfName)
-		if err != nil {
-			return err // not tested
-		}
-
-		err = netlink.LinkSetDown(link)
-		if err != nil {
-			return err // not tested
-		}
-
-		return nil
-	})
-	if err != nil {
-		//  if NetNs is passed down by the Cloud Orchestration Engine, or if it called multiple times
-		// so don't return an error if the device is already removed.
-		// https://github.com/kubernetes/kubernetes/issues/43014#issuecomment-287164444
-		_, ok := err.(ns.NSPathNotExistErr)
-		if ok {
-			return nil
-		}
-		return err
-	}
-
+	// On DEL, the previous implementation looked up `lo` and brought it down
+	// before returning. That accomplished nothing: when the network namespace
+	// itself is torn down (which happens immediately after this hook on every
+	// CNI runtime modal uses), `lo` is destroyed with it, so the explicit
+	// `LinkSetDown` was redundant. We skip both the lookup and the down to
+	// avoid two additional `rtnl_mutex` acquires per container teardown.
 	return nil
 }
 
@@ -179,7 +120,8 @@ func cmdCheck(args *skel.CmdArgs) error {
 	args.IfName = "lo" // ignore config, this only works for loopback
 
 	return ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-		link, err := netlink.LinkByName(args.IfName)
+		// LinkByIndex(1) targets `lo` directly without a name-based lookup.
+		link, err := netlink.LinkByIndex(loopbackIfIndex)
 		if err != nil {
 			return err
 		}
