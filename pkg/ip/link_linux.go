@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/safchain/ethtool"
 	"github.com/vishvananda/netlink"
@@ -27,6 +29,21 @@ import (
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/utils/sysctl"
 )
+
+// ifindexFromSysfs returns the ifindex of `name` in the current netns by
+// reading `/sys/class/net/<name>/ifindex`. This is a sysfs file read that
+// requires no rtnl_mutex acquisition, which lets callers populate
+// netlink.LinkAttrs.Index without an extra RTM_GETLINK round-trip. Used in
+// place of `netlink.LinkByName()` on the hot path after a freshly-created
+// veth: on heavily-loaded modal workers each RTM_GETLINK queues behind every
+// other rtnl_lock holder, so eliminating them cuts visible hook latency.
+func ifindexFromSysfs(name string) (int, error) {
+	b, err := os.ReadFile("/sys/class/net/" + name + "/ifindex")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(b)))
+}
 
 var ErrLinkNotFound = errors.New("link not found")
 
@@ -60,7 +77,14 @@ func makeVethPair(name, peer string, mtu int, mac string, hostNS ns.NetNS) (netl
 	if err := netlink.LinkAdd(veth); err != nil {
 		return nil, err
 	}
-	// Re-fetch the container link to get its creation-time parameters, e.g. index and mac
+	// Re-fetch the container link to get its creation-time parameters, e.g. index and mac.
+	//
+	// We can't sysfs-fast-path this one: makeVethPair runs inside the
+	// *container* netns (per SetupVeth's contract), and /sys/class/net is not
+	// netns-aware -- it always shows the initial netns's view of interfaces --
+	// so /sys/class/net/<container_veth>/ifindex doesn't exist here. The
+	// host-side and DEL-path lookups in this file still use the sysfs fast
+	// path because those run in the host netns.
 	veth2, err := netlink.LinkByName(name)
 	if err != nil {
 		netlink.LinkDel(veth) // try and clean up the link if possible.
@@ -154,10 +178,16 @@ func SetupVethWithName(contVethName, hostVethName string, mtu int, contVethMac s
 
 	var hostVeth netlink.Link
 	err = hostNS.Do(func(_ ns.NetNS) error {
-		hostVeth, err = netlink.LinkByName(hostVethName)
+		// Resolve the host-side veth's ifindex via sysfs rather than
+		// `netlink.LinkByName` for the same reason as makeVethPair above:
+		// avoid an RTM_GETLINK acquisition of rtnl_mutex on the hot path. We
+		// only need Index + Name to call LinkSetUp; the kernel doesn't read
+		// any other LinkAttrs for an IFF_UP change.
+		idx, err := ifindexFromSysfs(hostVethName)
 		if err != nil {
-			return fmt.Errorf("failed to lookup %q in %q: %v", hostVethName, hostNS.Path(), err)
+			return fmt.Errorf("failed to look up ifindex of %q in %q: %v", hostVethName, hostNS.Path(), err)
 		}
+		hostVeth = &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: idx, Name: hostVethName}}
 
 		if err = netlink.LinkSetUp(hostVeth); err != nil {
 			return fmt.Errorf("failed to set %q up: %v", hostVethName, err)
@@ -183,13 +213,16 @@ func SetupVeth(contVethName string, mtu int, contVethMac string, hostNS ns.NetNS
 
 // DelLinkByName removes an interface link.
 func DelLinkByName(ifName string) error {
-	iface, err := netlink.LinkByName(ifName)
+	// Resolve ifindex via sysfs to skip the RTM_GETLINK that `netlink.LinkByName`
+	// would otherwise issue. The kernel only needs an ifindex to delete a link.
+	idx, err := ifindexFromSysfs(ifName)
 	if err != nil {
-		if _, ok := err.(netlink.LinkNotFoundError); ok {
+		if os.IsNotExist(err) {
 			return ErrLinkNotFound
 		}
 		return fmt.Errorf("failed to lookup %q: %v", ifName, err)
 	}
+	iface := &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: idx, Name: ifName}}
 
 	if err = netlink.LinkDel(iface); err != nil {
 		return fmt.Errorf("failed to delete %q: %v", ifName, err)
@@ -200,13 +233,18 @@ func DelLinkByName(ifName string) error {
 
 // DelLinkByNameAddr remove an interface and returns its addresses
 func DelLinkByNameAddr(ifName string) ([]*net.IPNet, error) {
-	iface, err := netlink.LinkByName(ifName)
+	// Same sysfs-fast-path as DelLinkByName for the lookup, then issue an
+	// AddrList (which IS an RTM_GETADDR DUMP -- we keep it because the caller
+	// needs the addresses to clean up corresponding IPAM state). LinkDel
+	// follows on the same Device value.
+	idx, err := ifindexFromSysfs(ifName)
 	if err != nil {
-		if _, ok := err.(netlink.LinkNotFoundError); ok {
+		if os.IsNotExist(err) {
 			return nil, ErrLinkNotFound
 		}
 		return nil, fmt.Errorf("failed to lookup %q: %v", ifName, err)
 	}
+	iface := &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: idx, Name: ifName}}
 
 	addrs, err := netlink.AddrList(iface, netlink.FAMILY_ALL)
 	if err != nil {
