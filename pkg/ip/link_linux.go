@@ -32,10 +32,16 @@ var ErrLinkNotFound = errors.New("link not found")
 
 // makeVethPair is called from within the container's network namespace
 func makeVethPair(name, peer string, mtu int, mac string, hostNS ns.NetNS) (netlink.Link, error) {
+	// Pin one RX/TX queue per side. Without IFLA_NUM_{TX,RX}_QUEUES the veth
+	// driver allocates a queue pair per possible CPU and then frees all but one,
+	// churning thousands of sysfs kobjects and uevents per veth.
+	// Context: https://modal.enterprise.slack.com/archives/C0C0C24S1MY/p1788904817809469
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
-			Name: name,
-			MTU:  mtu,
+			Name:        name,
+			MTU:         mtu,
+			NumTxQueues: 1,
+			NumRxQueues: 1,
 		},
 		PeerName:      peer,
 		PeerNamespace: netlink.NsFd(int(hostNS.Fd())),
